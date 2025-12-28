@@ -6,8 +6,42 @@ import random
 
 class IMUVideoPreprocessing:
     """
-    Implémentation fidèle au preprocessing décrit dans l'article
-    IMU-Video Cross-modal Self-supervision for HAR
+    Préprocessing fidèle à l'article "IMU-Video Cross-modal Self-supervision for HAR".
+
+    Attributs (variables de classe) :
+    - target_freq (int):
+        Quoi : fréquence d'échantillonnage IMU cible après rééchantillonnage (par défaut 50 Hz).
+        Pourquoi : l’article impose 50 Hz pour uniformiser Ego4D / MMEA / PD et rendre les modèles comparables.
+        (Upsampling ou downsampling selon la fréquence d'origine).
+
+    - window_sec (int/float):
+        Quoi : durée d’une fenêtre temporelle IMU en secondes (par défaut 5 s).
+        Pourquoi : l’article entraîne/évalue sur des fenêtres fixes de 5 secondes. 
+
+    - window_size (int):
+        Quoi : nombre d’échantillons IMU par fenêtre = target_freq * window_sec.
+              Exemple : 50 Hz * 5 s = 250 points.
+        Pourquoi : correspond exactement au “context length = 250” (fenêtre 5 s à 50 Hz). 
+
+    - num_video_frames (int):
+        Quoi : nombre d’images (frames) représentant un segment vidéo de 5 s (par défaut 10).
+        Pourquoi : l’article divise les frames de 5 s en 10 chunks et choisit 1 frame aléatoire par chunk
+                  => 10 frames qui résument le “flow” de l’action. 
+
+    - median_kernel (int):
+        Quoi : taille du noyau du filtre médian (par défaut 5).
+        Pourquoi : l’article applique un median filtering kernel size 5 pour supprimer le bruit IMU. 
+        Note : typiquement kernel impair (3,5,7...) sinon certains filtres refusent.
+
+    - scaler (StandardScaler):
+        Quoi : objet qui applique la normalisation z-score (mean=0, std=1).
+        Pourquoi : l’article normalise les signaux IMU avec z-score après filtrage. 
+        Bon usage pratique : on “fit” le scaler sur le train seulement, puis “transform” val/test (pour éviter leakage).
+
+    - seed (int) + random.seed / np.random.seed:
+        Quoi : graine aléatoire pour reproductibilité.
+        Pourquoi : ton sampling aléatoire des frames (1 frame par chunk) dépend du hasard ;
+                  fixer un seed permet de reproduire exactement les mêmes fenêtres/frames d’un run à l’autre.
     """
 
     def __init__(self,
