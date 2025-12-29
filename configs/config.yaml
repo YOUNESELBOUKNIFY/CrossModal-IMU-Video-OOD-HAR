@@ -1,0 +1,27 @@
+project_name: "IMU-Video-HAR"
+
+data:
+  [cite_start]window_size: 250        # 5 secondes * 50 Hz [cite: 541]
+  [cite_start]num_channels: 6         # 3 acc + 3 gyro [cite: 521]
+  [cite_start]num_frames: 10          # 10 frames par segment vidéo [cite: 542]
+  [cite_start]batch_size: 32          # [cite: 565]
+  
+model:
+  imu:
+    [cite_start]patch_size: 16        # [cite: 564]
+    [cite_start]stride: 16            # [cite: 564]
+    dim: 128              # Dimension cachée (hypersparamètre standard pour PatchTST)
+    depth: 3              # Profondeur du Transformer
+    heads: 4
+    dropout: 0.1
+  video:
+    [cite_start]model_name: "MCG-NJU/videomae-base" # Pré-entraîné sur SSV2 [cite: 502]
+  [cite_start]projection_dim: 256     # Dimension de l'espace partagé pour la perte contrastive [cite: 508]
+
+training:
+  [cite_start]epochs: 50              # [cite: 565]
+  [cite_start]lr_pretrain: 0.0001     # 1e-4 [cite: 565]
+  [cite_start]lr_finetune_enc: 1.0e-6 # [cite: 572]
+  [cite_start]lr_finetune_head: 0.001 # [cite: 572]
+  [cite_start]temp_init: 10.0         # Init log 10 [cite: 516]
+  [cite_start]bias_init: -10.0        # Init -10 [cite: 516]
