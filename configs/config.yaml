@@ -16,7 +16,7 @@ model:
   projection_dim: 256
   imu:
     seq_len: 250     # 5s * 50Hz
-    patch_size: 16
+    patch_size: 8
     channels: 6
     embed_dim: 128
   video:
