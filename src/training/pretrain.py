@@ -24,35 +24,46 @@ def load_config(config_path):
     with open(full_path, 'r') as f:
         return yaml.safe_load(f)
 
+# Ajoutez cet import en haut si pas déjà présent (normalement torch l'a déjà)
+from torch.cuda.amp import autocast, GradScaler
+
 def train_one_epoch(model, dataloader, optimizer, device):
     model.train()
     total_loss = 0
     
-    # Barre de progression
+    # Initialisation du Scaler pour la précision mixte
+    scaler = GradScaler() 
+    
     loop = tqdm(dataloader, desc="Training")
     
     for batch_idx, (imu, video) in enumerate(loop):
-        # Envoi sur GPU
         imu = imu.to(device)
         video = video.to(device)
         
         optimizer.zero_grad()
         
-        # Forward pass
-        imu_feat, video_feat = model(imu, video)
+        # --- Optimisation Mémoire (AMP) ---
+        # On utilise autocast pour que le GPU utilise moins de RAM (FP16)
+        with autocast():
+            imu_feat, video_feat = model(imu, video)
+            
+            if isinstance(model, nn.DataParallel):
+                loss = model.module.compute_loss(imu_feat, video_feat)
+            else:
+                loss = model.compute_loss(imu_feat, video_feat)
         
-        # Calcul de la Loss (compatible DataParallel)
-        if isinstance(model, nn.DataParallel):
-            loss = model.module.compute_loss(imu_feat, video_feat)
-        else:
-            loss = model.compute_loss(imu_feat, video_feat)
+        # Backward pass avec le scaler
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         
-        # Backward
-        loss.backward()
-        optimizer.step()
+        # ----------------------------------
         
         total_loss += loss.item()
         loop.set_postfix(loss=loss.item())
+        
+        # Optionnel : Vider le cache GPU si on est vraiment limite
+        torch.cuda.empty_cache() 
         
     return total_loss / len(dataloader)
 
