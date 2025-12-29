@@ -1,5 +1,7 @@
 project_name: "IMU-Video-MMEA"
-
+# Exemple de ce qu'il doit y avoir dans configs/config.yaml
+dataset:
+  root_dir: /kaggle/input/dataset-har/UESTC-MMEA-CL
 preprocessing:
   imu:
     target_freq: 50
