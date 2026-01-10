@@ -1,461 +1,493 @@
 """
 Preprocessing complet du dataset MMEA pour IMU-Video Cross-modal Learning
-Conforme à l'article: fenêtres de 5s à 50Hz, median filter, z-score normalization
+
+✅ Conforme à la note du dataset :
+- Vidéo : ./video/[class_number]_[class_name]/xx.mp4
+- Capteurs : ./sensor/[class_number]_[class_name]/xx.csv
+- Même préfixe = même sample
+- CSV : 6 colonnes (acc x,y,z ; gyro x,y,z) en valeurs brutes
+- Conversion : acc_g = raw_acc / 16384, gyro_deg_s = raw_gyro / 16.4
+
+✅ Fenêtrage (par défaut) :
+- Fenêtres IMU 5s à 50Hz => 250 échantillons
+- Stride configurable (par défaut 50% overlap => 125)
+- Median filter + Z-score (optionnel)
+
+⚠️ Important :
+- On SUPPRIME les "fallback" dangereux : si un chemin est invalide => on skip.
+- On construit le chemin vidéo à partir du chemin capteur, et on vérifie le préfixe.
 """
+
+import json
+import warnings
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-import json
-from pathlib import Path
-from typing import List, Dict, Tuple
-from tqdm import tqdm
 import scipy.signal as signal
-from collections import defaultdict
-import warnings
-warnings.filterwarnings('ignore')
+from tqdm import tqdm
+
+warnings.filterwarnings("ignore")
 
 
+# -----------------------------
+# Config helpers (optionnels)
+# -----------------------------
+@dataclass
+class DataConfig:
+    imu_sampling_rate: float = 50.0          # cible (Hz)
+    imu_original_rate: Optional[float] = None  # si None => pas de resample par défaut
+    imu_window_size: int = 250               # 5s*50Hz
+    imu_stride: int = 125                    # 50% overlap
+    median_filter_kernel: int = 5
+    normalize_imu: bool = True
+
+    video_fps: float = 25.0                  # utilisé pour start_frame
+    video_ext: str = ".mp4"
+
+    # Sensitivity factors (dataset note)
+    Racc: float = 16384.0
+    Rgyro: float = 16.4
+
+    # Si un sample est trop court, on peut soit pad, soit skip.
+    pad_short_sequences: bool = True         # True = pad, False = skip
+    min_windows_per_sample: int = 1          # si pad=False et trop court => 0 window => skip
+
+
+@dataclass
+class PathsConfig:
+    base_input: Path
+    preprocessed_dir: Path
+    train_file: str = "train.txt"
+    val_file: str = "val.txt"
+    test_file: str = "test.txt"
+
+
+@dataclass
+class Config:
+    paths: PathsConfig
+    data: DataConfig
+
+
+# -----------------------------
+# Preprocessor
+# -----------------------------
 class MMEAPreprocessor:
     """
-    Préprocesseur pour dataset MMEA
-    - Charge les données IMU et vidéo
-    - Crée des fenêtres de 5 secondes (250 timestamps à 50Hz)
-    - Applique median filtering et z-score normalization
-    - Associe les clips vidéo correspondants
+    Préprocesseur MMEA (sensor/csv + video/mp4)
+    - Crée fenêtres IMU
+    - Calcule start_frame estimé (si tu veux extraire un clip vidéo aligné)
+    - Sauvegarde windows + metadata CSV
     """
-    
-    def __init__(self, config):
+
+    def __init__(self, config: Config):
         self.config = config
         self.paths = config.paths
         self.data_cfg = config.data
-        
-        # Mapping classe -> indice
-        self.class_to_idx = {}
-        self.idx_to_class = {}
-        
-        # Stats pour rapport
+
         self.preprocessing_stats = {
-            'total_samples': 0,
-            'total_windows': 0,
-            'samples_with_video': 0,
-            'samples_without_video': 0,
-            'classes_found': set()
+            "total_samples": 0,
+            "skipped_samples": 0,
+            "total_windows": 0,
+            "samples_with_video": 0,
+            "samples_without_video": 0,
+            "classes_found": set(),
+            "bad_format_paths": 0,
+            "missing_sensor_files": 0,
+            "missing_video_files": 0,
+            "prefix_mismatch": 0,
         }
-    
+
+    # ---------- splits ----------
     def load_split(self, split: str) -> List[str]:
-        """
-        Charge un split (train/val/test)
-        Format attendu: chaque ligne = chemin relatif vers fichier sensor
-        Exemple: sensor/1/drink_water/1.txt
-        """
-        if split == 'train':
+        if split == "train":
             split_file = self.paths.base_input / self.paths.train_file
-        elif split == 'val':
+        elif split == "val":
             split_file = self.paths.base_input / self.paths.val_file
-        elif split == 'test':
+        elif split == "test":
             split_file = self.paths.base_input / self.paths.test_file
         else:
             raise ValueError(f"Split inconnu: {split}")
-        
+
         if not split_file.exists():
             raise FileNotFoundError(f"Fichier split introuvable: {split_file}")
-        
-        samples = []
-        with open(split_file, 'r') as f:
+
+        samples: List[str] = []
+        with open(split_file, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if line and not line.startswith('#'):  # Ignorer lignes vides et commentaires
+                if line and (not line.startswith("#")):
                     samples.append(line)
-        
+
         print(f"[{split}] Chargé {len(samples)} échantillons depuis {split_file}")
         return samples
-    
-    def parse_sample_path(self, sample_path: str) -> Dict:
+
+    # ---------- parsing paths ----------
+    def parse_sensor_relpath(self, sensor_relpath: str) -> Dict:
         """
-        Parse le chemin pour extraire: user_id, class_name, sample_id
-        Format MMEA: sensor/[user_id]/[class_name]/[sample_id].txt
-        Exemple: sensor/1/drink_water/1.txt
+        Attendu (relatif) : sensor/1_upstairs/1_upstairs_2020_12_15_15_58_48.csv
         """
-        parts = Path(sample_path).parts
-        
-        try:
-            # Trouver l'index de 'sensor'
-            sensor_idx = parts.index('sensor')
-            
-            if len(parts) >= sensor_idx + 4:
-                user_id = parts[sensor_idx + 1]
-                class_name = parts[sensor_idx + 2]
-                sample_id = Path(parts[sensor_idx + 3]).stem
-            else:
-                raise ValueError(f"Format de chemin invalide: {sample_path}")
-            
-        except (ValueError, IndexError) as e:
-            # Fallback: essayer de parser autrement
-            print(f"Avertissement: parsing fallback pour {sample_path}")
-            user_id = "unknown"
-            class_name = Path(sample_path).parent.name
-            sample_id = Path(sample_path).stem
-        
+        p = Path(sensor_relpath)
+        parts = p.parts
+
+        # Doit contenir 'sensor'
+        if "sensor" not in parts:
+            self.preprocessing_stats["bad_format_paths"] += 1
+            raise ValueError(f"Chemin invalide (pas de dossier 'sensor'): {sensor_relpath}")
+
+        # class_dir = élément juste après 'sensor'
+        sensor_idx = parts.index("sensor")
+        if len(parts) < sensor_idx + 2:
+            self.preprocessing_stats["bad_format_paths"] += 1
+            raise ValueError(f"Chemin invalide (pas de class_dir): {sensor_relpath}")
+
+        class_dir = parts[sensor_idx + 1]  # ex: "1_upstairs"
+        sample_id = p.stem                 # ex: "1_upstairs_2020_12_15_15_58_48"
+
+        # split class_dir => class_num + class_name
+        if "_" in class_dir:
+            class_num_str, class_name = class_dir.split("_", 1)
+        else:
+            class_num_str, class_name = class_dir, class_dir
+
+        class_num = int(class_num_str) if class_num_str.isdigit() else -1
+
         return {
-            'user_id': user_id,
-            'class_name': class_name,
-            'sample_id': sample_id,
-            'sensor_path': sample_path
+            "class_dir": class_dir,
+            "class_num": class_num,        # ex: 1
+            "class_name": class_name,      # ex: upstairs
+            "sample_id": sample_id,        # prefix commun
+            "sensor_path": sensor_relpath,
+            "user_id": "unknown",
         }
-    
-    def load_imu_data(self, sensor_path: str) -> np.ndarray:
+
+    # ---------- paths video ----------
+    def sensor_to_video_relpath(self, sensor_relpath: str) -> str:
         """
-        Charge les données IMU depuis un fichier texte
-        Format attendu: N lignes x 6 colonnes (acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z)
+        sensor/1_upstairs/xxx.csv -> video/1_upstairs/xxx.mp4
         """
-        full_path = self.paths.base_input / sensor_path
-        
+        p = Path(sensor_relpath)
+
+        # remplacer uniquement le premier dossier "sensor" par "video"
+        parts = list(p.parts)
+        if "sensor" not in parts:
+            raise ValueError(f"Chemin invalide (pas 'sensor'): {sensor_relpath}")
+        idx = parts.index("sensor")
+        parts[idx] = "video"
+
+        video_p = Path(*parts).with_suffix(self.data_cfg.video_ext)
+        return str(video_p)
+
+    def check_exists(self, relpath: str) -> bool:
+        return (self.paths.base_input / relpath).exists()
+
+    # ---------- IMU loading ----------
+    def load_imu_csv(self, sensor_relpath: str) -> Optional[np.ndarray]:
+        """
+        Lit CSV (6 colonnes) + conversion Racc/Rgyro.
+        Retourne np.ndarray shape (N, 6) float32, ou None si introuvable/erreur.
+        """
+        full_path = self.paths.base_input / sensor_relpath
         if not full_path.exists():
-            print(f"Avertissement: fichier IMU introuvable: {full_path}")
-            return np.zeros((100, 6))  # Retourner données vides
-        
+            self.preprocessing_stats["missing_sensor_files"] += 1
+            return None
+
         try:
-            # Essayer de charger avec numpy
-            data = np.loadtxt(full_path)
-            
-            # Vérifier dimensions
+            data = pd.read_csv(full_path, header=None).values.astype(np.float32)
+
             if data.ndim == 1:
-                # Si 1D, supposer que c'est une seule ligne
                 data = data.reshape(1, -1)
-            
-            # Vérifier nombre de colonnes
+
+            # Normaliser le nb de colonnes à 6
             if data.shape[1] < 6:
-                print(f"Avertissement: {sensor_path} a {data.shape[1]} colonnes < 6")
-                # Padding avec zeros
-                padding = np.zeros((data.shape[0], 6 - data.shape[1]))
-                data = np.hstack([data, padding])
+                pad = np.zeros((data.shape[0], 6 - data.shape[1]), dtype=np.float32)
+                data = np.hstack([data, pad])
             elif data.shape[1] > 6:
-                print(f"Avertissement: {sensor_path} a {data.shape[1]} colonnes > 6, troncature")
                 data = data[:, :6]
-            
-            return data.astype(np.float32)
-        
-        except Exception as e:
-            print(f"Erreur lors du chargement de {sensor_path}: {e}")
-            return np.zeros((100, 6), dtype=np.float32)
-    
-    def resample_imu(self, imu_data: np.ndarray, original_rate: float, target_rate: float = 50.0) -> np.ndarray:
-        """
-        Resample IMU data à la fréquence cible (50Hz par défaut)
-        """
+
+            # Conversion physique (dataset note)
+            acc = data[:, :3] / float(self.data_cfg.Racc)
+            gyro = data[:, 3:6] / float(self.data_cfg.Rgyro)
+            data = np.concatenate([acc, gyro], axis=1).astype(np.float32)
+
+            return data
+        except Exception:
+            # fichier corrompu / format bizarre => skip
+            return None
+
+    # ---------- signal ops ----------
+    def resample_imu(self, imu: np.ndarray, original_rate: float, target_rate: float) -> np.ndarray:
         if original_rate == target_rate:
-            return imu_data
-        
-        num_samples = imu_data.shape[0]
-        num_target_samples = int(num_samples * target_rate / original_rate)
-        
-        # Resample chaque canal indépendamment
-        resampled = []
-        for channel in range(imu_data.shape[1]):
-            resampled_channel = signal.resample(imu_data[:, channel], num_target_samples)
-            resampled.append(resampled_channel)
-        
-        return np.stack(resampled, axis=1).astype(np.float32)
-    
-    def preprocess_imu(self, imu_data: np.ndarray) -> np.ndarray:
-        """
-        Applique le preprocessing IMU conforme à l'article:
-        1. Median filtering (kernel size = 5)
-        2. Z-score normalization (par canal)
-        """
-        # 1) Median filtering pour réduction du bruit
-        if self.data_cfg.median_filter_kernel > 1:
-            # Appliquer median filter sur chaque canal
-            filtered = np.zeros_like(imu_data)
-            for channel in range(imu_data.shape[1]):
-                filtered[:, channel] = signal.medfilt(
-                    imu_data[:, channel],
-                    kernel_size=self.data_cfg.median_filter_kernel
-                )
-            imu_data = filtered
-        
-        # 2) Z-score normalization (par canal)
+            return imu
+
+        n = imu.shape[0]
+        n_target = int(round(n * target_rate / original_rate))
+        if n_target <= 1:
+            return imu
+
+        out = []
+        for ch in range(imu.shape[1]):
+            out.append(signal.resample(imu[:, ch], n_target))
+        return np.stack(out, axis=1).astype(np.float32)
+
+    def preprocess_imu(self, imu: np.ndarray) -> np.ndarray:
+        # 1) median filter
+        k = int(self.data_cfg.median_filter_kernel)
+        if k and k > 1:
+            # scipy medfilt demande k impair
+            if k % 2 == 0:
+                k += 1
+            filtered = np.zeros_like(imu, dtype=np.float32)
+            for ch in range(imu.shape[1]):
+                filtered[:, ch] = signal.medfilt(imu[:, ch], kernel_size=k)
+            imu = filtered
+
+        # 2) z-score par canal (sur ce sample)
         if self.data_cfg.normalize_imu:
-            mean = np.mean(imu_data, axis=0, keepdims=True)
-            std = np.std(imu_data, axis=0, keepdims=True) + 1e-8  # Éviter division par zéro
-            imu_data = (imu_data - mean) / std
-        
-        return imu_data.astype(np.float32)
-    
-    def create_imu_windows(self, imu_data: np.ndarray) -> List[np.ndarray]:
-        """
-        Crée des fenêtres glissantes sur les données IMU
-        Fenêtres de 250 timestamps (5 secondes à 50Hz) avec stride configurable
-        Returns: list of windows, shape (window_size, channels)
-        """
-        windows = []
-        window_size = self.data_cfg.imu_window_size  # 250
-        stride = self.data_cfg.imu_stride  # 125 par défaut (50% overlap)
-        
-        num_samples = imu_data.shape[0]
-        
-        # Vérifier si assez de données
-        if num_samples < window_size:
-            # Padding si pas assez de données
-            padding = np.zeros((window_size - num_samples, imu_data.shape[1]), dtype=np.float32)
-            imu_data = np.vstack([imu_data, padding])
-            num_samples = window_size
-        
-        # Créer les fenêtres
-        for start in range(0, num_samples - window_size + 1, stride):
-            window = imu_data[start:start + window_size]
-            windows.append(window)
-        
-        return windows
-    
-    def get_video_path(self, sensor_path: str) -> str:
-        """
-        Construit le chemin vidéo correspondant au sensor path
-        Exemple: sensor/1/drink_water/1.txt -> video/1/drink_water/1.avi
-        """
-        # Remplacer 'sensor' par 'video' et extension .txt par .avi
-        video_path = sensor_path.replace('sensor', 'video')
-        
-        # Changer extension
-        video_path = Path(video_path).with_suffix('.avi')
-        
-        return str(video_path)
-    
-    def check_video_exists(self, video_path: str) -> bool:
-        """Vérifie si le fichier vidéo existe"""
-        full_path = self.paths.base_input / video_path
-        return full_path.exists()
-    
-    def build_class_mapping(self, all_samples: List[str]):
-        """
-        Construit le mapping classe -> index à partir de tous les samples
-        """
-        classes = set()
-        for sample in all_samples:
-            info = self.parse_sample_path(sample)
-            classes.add(info['class_name'])
-        
-        # Trier pour cohérence
-        classes = sorted(list(classes))
-        
-        self.class_to_idx = {c: i for i, c in enumerate(classes)}
-        self.idx_to_class = {i: c for c, i in self.class_to_idx.items()}
-        
-        print(f"\n✓ Trouvé {len(classes)} classes:")
-        for i, c in enumerate(classes):
-            if i < 10:  # Afficher seulement les 10 premières
-                print(f"  {i}: {c}")
-        if len(classes) > 10:
-            print(f"  ... et {len(classes) - 10} autres")
-    
-    def preprocess_split(self, split: str, save: bool = True) -> pd.DataFrame:
-        """
-        Prétraite un split complet et génère un DataFrame avec les métadonnées
-        
-        Returns:
-            DataFrame avec colonnes:
-            - split, user_id, class_name, label, sample_id, window_idx
-            - sensor_path, video_path, video_exists
-            - imu_window_path (chemin vers .npy sauvegardé)
-            - start_frame (pour extraire le clip vidéo correspondant)
-        """
-        samples = self.load_split(split)
-        self.preprocessing_stats['total_samples'] += len(samples)
-        
-        records = []
-        
-        print(f"\n{'='*60}")
-        print(f"Preprocessing du split: {split.upper()}")
-        print(f"{'='*60}")
-        
-        for sample_path in tqdm(samples, desc=f"Processing {split}"):
-            # Parse info
-            info = self.parse_sample_path(sample_path)
-            self.preprocessing_stats['classes_found'].add(info['class_name'])
-            
-            # Charger IMU
-            imu_raw = self.load_imu_data(sample_path)
-            
-            # Resample à 50Hz (supposer que MMEA est à 25Hz initialement)
-            # Note: ajuster original_rate selon vos données réelles
-            imu_resampled = self.resample_imu(imu_raw, original_rate=25.0, target_rate=50.0)
-            
-            # Preprocessing
-            imu_preprocessed = self.preprocess_imu(imu_resampled)
-            
-            # Créer windows
-            windows = self.create_imu_windows(imu_preprocessed)
-            
-            # Video path
-            video_path = self.get_video_path(sample_path)
-            video_exists = self.check_video_exists(video_path)
-            
-            if video_exists:
-                self.preprocessing_stats['samples_with_video'] += 1
+            mean = imu.mean(axis=0, keepdims=True)
+            std = imu.std(axis=0, keepdims=True) + 1e-8
+            imu = (imu - mean) / std
+
+        return imu.astype(np.float32)
+
+    def create_imu_windows(self, imu: np.ndarray) -> List[np.ndarray]:
+        ws = int(self.data_cfg.imu_window_size)
+        stride = int(self.data_cfg.imu_stride)
+        n = imu.shape[0]
+
+        if n < ws:
+            if self.data_cfg.pad_short_sequences:
+                pad = np.zeros((ws - n, imu.shape[1]), dtype=np.float32)
+                imu = np.vstack([imu, pad])
+                n = ws
             else:
-                self.preprocessing_stats['samples_without_video'] += 1
-            
-            # Label
-            class_name = info['class_name']
-            label = self.class_to_idx.get(class_name, -1)
-            
-            # Sauvegarder chaque window
-            for i, window in enumerate(windows):
-                self.preprocessing_stats['total_windows'] += 1
-                
-                # Calculer start_frame pour la vidéo
-                # À 25 FPS vidéo et stride de 125 samples (2.5s à 50Hz)
-                video_fps = self.data_cfg.video_fps
-                start_time = i * (self.data_cfg.imu_stride / self.data_cfg.imu_sampling_rate)
-                start_frame = int(start_time * video_fps)
-                
+                return []  # skip
+
+        windows = []
+        for start in range(0, n - ws + 1, stride):
+            windows.append(imu[start:start + ws])
+        return windows
+
+    # ---------- alignment helpers ----------
+    def estimate_start_frame(self, window_idx: int) -> int:
+        """
+        Estime le start_frame vidéo correspondant à la window IMU.
+        Hypothèse : IMU et vidéo sont synchronisés et commencent au même t=0.
+        """
+        sr = float(self.data_cfg.imu_sampling_rate)
+        stride = float(self.data_cfg.imu_stride)
+        start_time_sec = window_idx * (stride / sr)
+        return int(round(start_time_sec * float(self.data_cfg.video_fps)))
+
+    # ---------- main split processing ----------
+    def preprocess_split(self, split: str, save: bool = True) -> pd.DataFrame:
+        samples = self.load_split(split)
+        self.preprocessing_stats["total_samples"] += len(samples)
+
+        records: List[Dict] = []
+
+        print("\n" + "=" * 60)
+        print(f"Preprocessing du split: {split.upper()}")
+        print("=" * 60)
+
+        for sensor_relpath in tqdm(samples, desc=f"Processing {split}"):
+            # 1) parse + construire chemins
+            try:
+                info = self.parse_sensor_relpath(sensor_relpath)
+            except ValueError:
+                self.preprocessing_stats["skipped_samples"] += 1
+                continue
+
+            self.preprocessing_stats["classes_found"].add(info["class_dir"])
+
+            video_relpath = self.sensor_to_video_relpath(sensor_relpath)
+
+            sensor_ok = self.check_exists(sensor_relpath)
+            video_ok = self.check_exists(video_relpath)
+
+            if not sensor_ok:
+                self.preprocessing_stats["missing_sensor_files"] += 1
+                self.preprocessing_stats["skipped_samples"] += 1
+                continue
+
+            if video_ok:
+                self.preprocessing_stats["samples_with_video"] += 1
+            else:
+                self.preprocessing_stats["samples_without_video"] += 1
+                self.preprocessing_stats["missing_video_files"] += 1
+                # Tu peux décider de skip les samples sans vidéo si tu fais du cross-modal strict
+                # Ici, on garde quand même la metadata, mais les windows auront video_exists=False
+
+            # 2) vérifier prefix (même sample_id)
+            #    vidéo et csv doivent partager le même stem
+            if Path(video_relpath).stem != Path(sensor_relpath).stem:
+                self.preprocessing_stats["prefix_mismatch"] += 1
+                self.preprocessing_stats["skipped_samples"] += 1
+                continue
+
+            # 3) load imu
+            imu_raw = self.load_imu_csv(sensor_relpath)
+            if imu_raw is None or imu_raw.size == 0:
+                self.preprocessing_stats["skipped_samples"] += 1
+                continue
+
+            # 4) resample si on connait original_rate
+            orig_rate = self.data_cfg.imu_original_rate
+            if orig_rate is not None:
+                imu_raw = self.resample_imu(
+                    imu_raw,
+                    original_rate=float(orig_rate),
+                    target_rate=float(self.data_cfg.imu_sampling_rate),
+                )
+
+            # 5) preprocess
+            imu_proc = self.preprocess_imu(imu_raw)
+
+            # 6) windows
+            windows = self.create_imu_windows(imu_proc)
+            if (not windows) and (not self.data_cfg.pad_short_sequences):
+                self.preprocessing_stats["skipped_samples"] += 1
+                continue
+
+            # 7) label basé sur class_num (plus fiable que mapping texte)
+            #    si tes classes commencent à 1, tu peux faire label = class_num - 1
+            label = info["class_num"]
+
+            # 8) save windows + records
+            for w_idx, window in enumerate(windows):
+                self.preprocessing_stats["total_windows"] += 1
+
                 record = {
-                    'split': split,
-                    'user_id': info['user_id'],
-                    'class_name': class_name,
-                    'label': label,
-                    'sample_id': info['sample_id'],
-                    'window_idx': i,
-                    'sensor_path': sample_path,
-                    'video_path': video_path,
-                    'video_exists': video_exists,
-                    'start_frame': start_frame,
-                    'imu_shape_0': window.shape[0],
-                    'imu_shape_1': window.shape[1],
+                    "split": split,
+                    "user_id": info["user_id"],
+                    "class_dir": info["class_dir"],
+                    "class_name": info["class_name"],
+                    "class_num": info["class_num"],
+                    "label": label,
+                    "sample_id": info["sample_id"],
+                    "window_idx": w_idx,
+                    "sensor_path": sensor_relpath,
+                    "video_path": video_relpath,
+                    "video_exists": video_ok,
+                    "start_frame": self.estimate_start_frame(w_idx),
+                    "imu_shape_0": int(window.shape[0]),
+                    "imu_shape_1": int(window.shape[1]),
                 }
-                
-                # Sauvegarder le window IMU
+
                 if save:
-                    # Créer répertoire
-                    window_save_dir = self.paths.preprocessed_dir / split
-                    window_save_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Nom de fichier unique
-                    window_filename = f"user{info['user_id']}_{class_name}_{info['sample_id']}_w{i}.npy"
-                    window_save_path = window_save_dir / window_filename
-                    
-                    np.save(window_save_path, window)
-                    record['imu_window_path'] = str(window_save_path)
-                
+                    out_dir = self.paths.preprocessed_dir / split
+                    out_dir.mkdir(parents=True, exist_ok=True)
+
+                    # nom stable : classdir + sample_id + window
+                    window_filename = f"{info['class_dir']}_{info['sample_id']}_w{w_idx}.npy"
+                    window_path = out_dir / window_filename
+                    np.save(window_path, window.astype(np.float32))
+                    record["imu_window_path"] = str(window_path)
+
                 records.append(record)
-        
-        # Créer DataFrame
+
         df = pd.DataFrame(records)
-        
-        # Sauvegarder metadata
+
         if save:
+            self.paths.preprocessed_dir.mkdir(parents=True, exist_ok=True)
             csv_path = self.paths.preprocessed_dir / f"{split}_metadata.csv"
             df.to_csv(csv_path, index=False)
             print(f"\n✓ Metadata sauvegardée: {csv_path}")
-            print(f"  Total windows: {len(df)}")
-            print(f"  Windows avec vidéo: {df['video_exists'].sum()}")
-            print(f"  Windows sans vidéo: {(~df['video_exists']).sum()}")
-        
+            if len(df) > 0:
+                print(f"  Total windows: {len(df)}")
+                print(f"  Windows avec vidéo: {int(df['video_exists'].sum())}")
+                print(f"  Windows sans vidéo: {int((~df['video_exists']).sum())}")
+            else:
+                print("  ⚠️ Aucun record généré (vérifie les chemins/splits).")
+
         return df
-    
-    def run_full_preprocessing(self):
-        """
-        Lance le preprocessing complet sur tous les splits
-        """
-        print("\n" + "="*60)
+
+    def run_full_preprocessing(self) -> Dict[str, pd.DataFrame]:
+        print("\n" + "=" * 60)
         print("PREPROCESSING COMPLET DU DATASET MMEA")
-        print("="*60)
-        
-        # 1. Charger tous les samples pour construire class mapping
-        print("\nÉtape 1: Construction du mapping des classes...")
-        all_samples = []
-        for split in ['train', 'val', 'test']:
+        print("=" * 60)
+
+        results: Dict[str, pd.DataFrame] = {}
+
+        for split in ["train", "val", "test"]:
             try:
-                samples = self.load_split(split)
-                all_samples.extend(samples)
+                results[split] = self.preprocess_split(split, save=True)
             except FileNotFoundError:
                 print(f"Avertissement: split '{split}' introuvable, ignoré")
-        
-        self.build_class_mapping(all_samples)
-        
-        # Sauvegarder le mapping
-        mapping_path = self.paths.preprocessed_dir / 'class_mapping.json'
-        mapping_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(mapping_path, 'w') as f:
-            json.dump({
-                'class_to_idx': self.class_to_idx,
-                'idx_to_class': self.idx_to_class,
-                'num_classes': len(self.class_to_idx)
-            }, f, indent=2)
-        print(f"✓ Mapping classes sauvegardé: {mapping_path}")
-        
-        # 2. Preprocess chaque split
-        print("\nÉtape 2: Preprocessing des splits...")
-        results = {}
-        
-        for split in ['train', 'val', 'test']:
-            try:
-                df = self.preprocess_split(split, save=True)
-                results[split] = df
-            except FileNotFoundError:
-                print(f"Avertissement: split '{split}' introuvable, ignoré")
-                continue
-        
-        # 3. Afficher statistiques finales
-        print("\n" + "="*60)
+
+        # stats
+        print("\n" + "=" * 60)
         print("STATISTIQUES FINALES")
-        print("="*60)
-        print(f"Total échantillons: {self.preprocessing_stats['total_samples']}")
+        print("=" * 60)
+        print(f"Total échantillons (dans splits): {self.preprocessing_stats['total_samples']}")
+        print(f"Échantillons skip: {self.preprocessing_stats['skipped_samples']}")
         print(f"Total windows créées: {self.preprocessing_stats['total_windows']}")
         print(f"Échantillons avec vidéo: {self.preprocessing_stats['samples_with_video']}")
         print(f"Échantillons sans vidéo: {self.preprocessing_stats['samples_without_video']}")
         print(f"Classes trouvées: {len(self.preprocessing_stats['classes_found'])}")
-        
-        print("\nDistribution par split:")
-        for split, df in results.items():
-            print(f"  {split.upper()}:")
-            print(f"    - Windows: {len(df)}")
-            print(f"    - Classes: {df['class_name'].nunique()}")
-            print(f"    - Users: {df['user_id'].nunique()}")
-            
-            # Top 5 classes
-            print(f"    - Top 5 classes:")
-            for class_name, count in df['class_name'].value_counts().head(5).items():
-                print(f"      • {class_name}: {count}")
-        
-        # Sauvegarder stats
-        stats_path = self.paths.preprocessed_dir / 'preprocessing_stats.json'
-        with open(stats_path, 'w') as f:
-            stats_to_save = self.preprocessing_stats.copy()
-            stats_to_save['classes_found'] = list(stats_to_save['classes_found'])
+        print(f"Bad format paths: {self.preprocessing_stats['bad_format_paths']}")
+        print(f"Missing sensor: {self.preprocessing_stats['missing_sensor_files']}")
+        print(f"Missing video: {self.preprocessing_stats['missing_video_files']}")
+        print(f"Prefix mismatch: {self.preprocessing_stats['prefix_mismatch']}")
+
+        # save stats
+        stats_path = self.paths.preprocessed_dir / "preprocessing_stats.json"
+        stats_to_save = dict(self.preprocessing_stats)
+        stats_to_save["classes_found"] = sorted(list(stats_to_save["classes_found"]))
+        self.paths.preprocessed_dir.mkdir(parents=True, exist_ok=True)
+        with open(stats_path, "w", encoding="utf-8") as f:
             json.dump(stats_to_save, f, indent=2)
         print(f"\n✓ Statistiques sauvegardées: {stats_path}")
-        
-        print("\n" + "="*60)
-        print("PREPROCESSING TERMINÉ AVEC SUCCÈS!")
-        print("="*60)
-        
+        print("\n" + "=" * 60)
+        print("PREPROCESSING TERMINÉ")
+        print("=" * 60)
+
         return results
 
 
+# -----------------------------
+# main (exemple)
+# -----------------------------
 def main():
-    """Fonction principale pour test standalone"""
-    import sys
-    sys.path.append('.')
-    
-    from config import CONFIG
-    
+    # Exemple minimal : adapte tes chemins Kaggle
+    base_input = Path("/kaggle/input/dataset-har/UESTC-MMEA-CL")  # <-- adapte si besoin
+    preproc_dir = Path("./preprocessed_mmea")                     # <-- sortie
+
+    cfg = Config(
+        paths=PathsConfig(
+            base_input=base_input,
+            preprocessed_dir=preproc_dir,
+            train_file="train.txt",
+            val_file="val.txt",
+            test_file="test.txt",
+        ),
+        data=DataConfig(
+            imu_sampling_rate=50.0,
+            imu_original_rate=None,   # mets 50.0 ou 100.0 si tu connais la fréquence réelle
+            imu_window_size=250,
+            imu_stride=125,
+            median_filter_kernel=5,
+            normalize_imu=True,
+            video_fps=25.0,
+            video_ext=".mp4",
+            Racc=16384.0,
+            Rgyro=16.4,
+            pad_short_sequences=True,
+        )
+    )
+
     print("Test du preprocessor MMEA")
-    print(f"Dataset path: {CONFIG.paths.base_input}")
-    
-    # Vérifier que le dataset existe
-    if not CONFIG.paths.base_input.exists():
-        print(f"ERREUR: Dataset introuvable à {CONFIG.paths.base_input}")
-        print("Veuillez ajuster les chemins dans config.py")
+    print(f"Dataset path: {cfg.paths.base_input}")
+
+    if not cfg.paths.base_input.exists():
+        print(f"ERREUR: Dataset introuvable à {cfg.paths.base_input}")
         return
-    
-    # Créer preprocessor
-    preprocessor = MMEAPreprocessor(CONFIG)
-    
-    # Lancer preprocessing
-    results = preprocessor.run_full_preprocessing()
-    
-    print("\n✓ Test terminé avec succès!")
+
+    preprocessor = MMEAPreprocessor(cfg)
+    preprocessor.run_full_preprocessing()
+    print("\n✓ Terminé.")
 
 
 if __name__ == "__main__":
