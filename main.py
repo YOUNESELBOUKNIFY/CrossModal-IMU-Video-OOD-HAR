@@ -16,14 +16,14 @@ import pandas as pd
 # Add src to path
 sys.path.append(str(Path(__file__).parent))
 
-from config import CONFIG
-from preprocessing import MMEAPreprocessor
-from datasets import create_dataloaders
-from models import CrossModalModel, IMUEncoder, IMUClassifier
-from losses import SigmoidContrastiveLoss
-from trainer import CrossModalTrainer, ClassificationTrainer
-from evaluator import Evaluator, FewShotEvaluator
-from utils import (
+from configs.config import CONFIG
+from src.data.preprocessing import MMEAPreprocessor
+from src.data.datasets import create_dataloaders
+from src.models.models import CrossModalModel, IMUEncoder, IMUClassifier
+from src.models.losses import SigmoidContrastiveLoss
+from src.train.trainer import CrossModalTrainer, ClassificationTrainer
+from src.eval.evaluator import Evaluator, FewShotEvaluator
+from src.utils import (
     set_seed, get_device, check_dataset_paths,
     print_model_info, plot_training_curves
 )
