@@ -44,7 +44,6 @@ class Pipeline:
         self.device = get_device()
         set_seed(config.training.seed)
 
-        # Vérifier les chemins dataset
         if not check_dataset_paths(config):
             raise ValueError("Chemins du dataset invalides !")
 
@@ -52,9 +51,6 @@ class Pipeline:
         print(f"Device: {self.device}")
 
     def run_preprocessing(self):
-        """
-        Étape 1: Preprocessing du dataset
-        """
         print("\n" + "=" * 60)
         print("ÉTAPE 1: PREPROCESSING")
         print("=" * 60)
@@ -62,7 +58,6 @@ class Pipeline:
         preprocessor = MMEAPreprocessor(self.config)
         results = preprocessor.run_full_preprocessing()
 
-        # Afficher stats
         print("\n=== Statistiques ===")
         for split, df in results.items():
             print(f"{split}: {len(df)} windows, {df['class_name'].nunique()} classes")
@@ -78,18 +73,15 @@ class Pipeline:
         print("ÉTAPE 2: CROSS-MODAL PRETRAINING")
         print("=" * 60)
 
-        # Charger metadata
         train_df = pd.read_csv(self.config.paths.preprocessed_dir / "train_metadata.csv")
-        val_df = pd.read_csv(self.config.paths.preprocessed_dir / "val_metadata.csv")
-        test_df = pd.read_csv(self.config.paths.preprocessed_dir / "test_metadata.csv")
+        val_df   = pd.read_csv(self.config.paths.preprocessed_dir / "val_metadata.csv")
+        test_df  = pd.read_csv(self.config.paths.preprocessed_dir / "test_metadata.csv")
 
-        # Dataloaders
         print("\nCréation des dataloaders...")
         dataloaders = create_dataloaders(
             self.config, train_df, val_df, test_df, mode="cross_modal"
         )
 
-        # Modèle
         print("\nCréation du modèle...")
         model = CrossModalModel(self.config)
         print_model_info(model, "Cross-Modal Model")
@@ -102,15 +94,12 @@ class Pipeline:
         else:
             print(f"\n✓ Single GPU/CPU: device={self.device}, n_gpu={n_gpu}")
 
-        # Loss + Trainer
         loss_fn = SigmoidContrastiveLoss(learnable=True)
         trainer = CrossModalTrainer(model, loss_fn, self.config, device=str(self.device))
 
-        # Fit
         print("\nDébut de l'entraînement...")
         trainer.fit(dataloaders["train"], dataloaders["val"])
 
-        # Courbes
         plot_training_curves(
             trainer.history,
             save_path=self.config.paths.results_dir / "pretraining_curves.png",
@@ -139,24 +128,21 @@ class Pipeline:
     def run_classification(self, mode="both"):
         """
         Étape 3: Classification (linear probe + finetune)
-        Args:
-            mode: 'linear_probe', 'finetune', ou 'both'
         """
+        import copy
+
         print("\n" + "=" * 60)
         print("ÉTAPE 3: CLASSIFICATION")
         print("=" * 60)
 
-        # Charger metadata
         train_df = pd.read_csv(self.config.paths.preprocessed_dir / "train_metadata.csv")
-        val_df = pd.read_csv(self.config.paths.preprocessed_dir / "val_metadata.csv")
-        test_df = pd.read_csv(self.config.paths.preprocessed_dir / "test_metadata.csv")
+        val_df   = pd.read_csv(self.config.paths.preprocessed_dir / "val_metadata.csv")
+        test_df  = pd.read_csv(self.config.paths.preprocessed_dir / "test_metadata.csv")
 
-        # Dataloaders classification
         clf_loaders = create_dataloaders(
             self.config, train_df, val_df, test_df, mode="classification"
         )
 
-        # Charger checkpoint pretrain
         print("\nChargement de l'encodeur pré-entraîné...")
         checkpoint_path = self.config.paths.checkpoints_dir / "cross_modal" / "best_model.pt"
         if not checkpoint_path.exists():
@@ -168,19 +154,23 @@ class Pipeline:
         checkpoint = torch.load(checkpoint_path, map_location=str(self.device))
 
         cross_modal_model = CrossModalModel(self.config)
-        # Important: si tu as sauvé un checkpoint depuis DataParallel, il peut avoir 'module.'.
-        # Ici on suppose que ton Trainer gère déjà ça; sinon tu peux ajouter un petit strip.
-        cross_modal_model.load_state_dict(checkpoint["model_state_dict"])
+
+        # strip 'module.' si checkpoint DataParallel
+        state = checkpoint["model_state_dict"]
+        if any(k.startswith("module.") for k in state.keys()):
+            state = {k.replace("module.", "", 1): v for k, v in state.items()}
+
+        cross_modal_model.load_state_dict(state, strict=True)
+
         pretrained_encoder = cross_modal_model.imu_encoder
+        encoder_probe = copy.deepcopy(pretrained_encoder)
+        encoder_ft    = copy.deepcopy(pretrained_encoder)
 
         results = {}
 
-        # Linear probing
         if mode in ["linear_probe", "both"]:
             print("\n--- Linear Probing ---")
-            classifier_probe = IMUClassifier(
-                pretrained_encoder, self.config, freeze_encoder=True
-            )
+            classifier_probe = IMUClassifier(encoder_probe, self.config, freeze_encoder=True)
             print_model_info(classifier_probe, "Classifier (Linear Probe)")
 
             trainer_probe = ClassificationTrainer(
@@ -191,12 +181,9 @@ class Pipeline:
             evaluator_probe = Evaluator(classifier_probe, self.config, device=str(self.device))
             results["linear_probe"] = evaluator_probe.evaluate(clf_loaders["test"])
 
-        # Full finetuning
         if mode in ["finetune", "both"]:
             print("\n--- Full Finetuning ---")
-            classifier_ft = IMUClassifier(
-                pretrained_encoder, self.config, freeze_encoder=False
-            )
+            classifier_ft = IMUClassifier(encoder_ft, self.config, freeze_encoder=False)
             print_model_info(classifier_ft, "Classifier (Finetune)")
 
             trainer_ft = ClassificationTrainer(
@@ -207,7 +194,6 @@ class Pipeline:
             evaluator_ft = Evaluator(classifier_ft, self.config, device=str(self.device))
             results["finetune"] = evaluator_ft.evaluate(clf_loaders["test"])
 
-        # Comparaison
         if mode == "both":
             print("\n=== Comparaison des résultats ===")
             comparison = pd.DataFrame(
@@ -217,7 +203,6 @@ class Pipeline:
                 }
             ).T
             print(comparison.to_string())
-
             comparison.to_csv(self.config.paths.results_dir / "classification_comparison.csv")
 
         return results
@@ -226,71 +211,83 @@ class Pipeline:
         """
         Étape 4: Évaluation complète (few-shot, ablations, etc.)
         """
+        import torch
+        import pandas as pd
+
         print("\n" + "=" * 60)
         print("ÉTAPE 4: ÉVALUATION COMPLÈTE")
         print("=" * 60)
 
-        train_df = pd.read_csv(self.config.paths.preprocessed_dir / "train_metadata.csv")
-        test_df = pd.read_csv(self.config.paths.preprocessed_dir / "test_metadata.csv")
+        train_meta = self.config.paths.preprocessed_dir / "train_metadata.csv"
+        test_meta  = self.config.paths.preprocessed_dir / "test_metadata.csv"
 
-        checkpoint_path = self.config.paths.checkpoints_dir / "cross_modal" / "best_model.pt"
-        if not checkpoint_path.exists():
+        if not train_meta.exists() or not test_meta.exists():
             raise FileNotFoundError(
-                f"Checkpoint introuvable: {checkpoint_path}\n"
-                "Veuillez d'abord exécuter le pretraining !"
+                "Metadata introuvable. Lance d'abord le preprocessing."
             )
 
-        checkpoint = torch.load(checkpoint_path, map_location=str(self.device))
-        cross_modal_model = CrossModalModel(self.config)
-        cross_modal_model.load_state_dict(checkpoint["model_state_dict"])
-        pretrained_encoder = cross_modal_model.imu_encoder
+        train_df = pd.read_csv(train_meta)
+        test_df  = pd.read_csv(test_meta)
 
-        # Few-shot
+        checkpoint_path = (
+            self.config.paths.checkpoints_dir / "cross_modal" / "best_model.pt"
+        )
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                "Checkpoint introuvable. Lance d'abord le pretraining."
+            )
+
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+        cross_modal_model = CrossModalModel(self.config)
+
+        state = checkpoint.get("model_state_dict", checkpoint)
+        if any(k.startswith("module.") for k in state.keys()):
+            state = {k.replace("module.", "", 1): v for k, v in state.items()}
+
+        cross_modal_model.load_state_dict(state, strict=False)
+
+        device = torch.device(self.device)
+        pretrained_encoder = cross_modal_model.imu_encoder.to(device)
+        pretrained_encoder.eval()
+
         print("\n--- Few-Shot Evaluation ---")
-        fs_evaluator = FewShotEvaluator(self.config, device=str(self.device))
+        fs_evaluator = FewShotEvaluator(self.config, device=str(device))
 
         fs_results = fs_evaluator.run_few_shot_experiments(
-            pretrained_encoder,
-            train_df,
-            test_df,
+            pretrained_encoder=pretrained_encoder,
+            train_df=train_df,
+            test_df=test_df,
             experiment_name="cross_modal_pretrained",
         )
 
         fs_agg = fs_evaluator.aggregate_results(fs_results)
 
-        print("\n=== Few-Shot Results ===")
-        print(fs_agg.to_string())
+        results_dir = self.config.paths.results_dir
+        results_dir.mkdir(parents=True, exist_ok=True)
 
-        fs_results.to_csv(self.config.paths.results_dir / "fewshot_results_raw.csv", index=False)
-        fs_agg.to_csv(self.config.paths.results_dir / "fewshot_results_agg.csv", index=False)
+        fs_results.to_csv(results_dir / "fewshot_results_raw.csv", index=False)
+        fs_agg.to_csv(results_dir / "fewshot_results_agg.csv", index=False)
 
         print("\n✓ Évaluation terminée")
         return fs_results, fs_agg
 
     def run_all(self):
-        """
-        Exécute le pipeline complet
-        """
         print("\n" + "=" * 60)
         print("PIPELINE COMPLET - DÉBUT")
         print("=" * 60)
 
-        # 1) Preprocess
         if not (self.config.paths.preprocessed_dir / "train_metadata.csv").exists():
             self.run_preprocessing()
         else:
             print("\n✓ Preprocessing déjà effectué")
 
-        # 2) Pretrain
         if not (self.config.paths.checkpoints_dir / "cross_modal" / "best_model.pt").exists():
             self.run_pretraining()
         else:
             print("\n✓ Pretraining déjà effectué")
 
-        # 3) Classification
         self.run_classification(mode="both")
-
-        # 4) Eval
         self.run_evaluation()
 
         print("\n" + "=" * 60)
@@ -304,7 +301,7 @@ class Pipeline:
         Génère un rapport final avec tous les résultats
         """
         import json
-        from src.utils import create_results_summary  # <- important: chemin correct
+        from src.utils import create_results_summary  # chemin correct
 
         print("\n=== Génération du rapport final ===")
 
@@ -318,7 +315,6 @@ class Pipeline:
             "files": create_results_summary(results_dir),
         }
 
-        # Charger résultats si dispo
         try:
             classification_results = pd.read_csv(
                 results_dir / "classification_comparison.csv", index_col=0
@@ -380,3 +376,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# TON CODE COMPLET ICI
+

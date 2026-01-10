@@ -133,9 +133,9 @@ class FewShotEvaluator:
         Returns:
             DataFrame avec résultats
         """
-        from datasets import FewShotSampler, IMUClassificationDataset, DataLoader
-        from models import IMUClassifier
-        from trainer import ClassificationTrainer
+        from src.data.datasets import FewShotSampler, IMUClassificationDataset, DataLoader
+        from src.models.models import IMUClassifier
+        from src.train.trainer import ClassificationTrainer
         
         results = []
         
