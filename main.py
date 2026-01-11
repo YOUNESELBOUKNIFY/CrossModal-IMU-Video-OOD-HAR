@@ -34,6 +34,7 @@ from src.utils import (
 )
 
 
+
 class Pipeline:
     """
     Pipeline complet pour IMU-Video HAR
@@ -64,10 +65,36 @@ class Pipeline:
 
         return results
 
+    def _sample_k_per_class(self, df: pd.DataFrame, k: int, seed: int = 42) -> pd.DataFrame:
+        """
+        Prend k échantillons par classe (colonne 'label').
+        - k <= 0 => retourne df complet
+        - si une classe a < k => on garde tout
+        """
+        if k is None or int(k) <= 0:
+            return df
+
+        if "label" not in df.columns:
+            raise ValueError("La colonne 'label' est introuvable dans metadata_df.")
+
+        k = int(k)
+
+        grouped = df.groupby("label", group_keys=False)
+
+        def _sample(g):
+            if len(g) <= k:
+                return g
+            return g.sample(n=k, random_state=seed)
+
+        out = grouped.apply(_sample).reset_index(drop=True)
+        out = out.sample(frac=1.0, random_state=seed).reset_index(drop=True)  # shuffle
+        return out
+
     def run_pretraining(self):
         """
         Étape 2: Pretraining cross-modal
         Support 1 GPU ou multi-GPU via DataParallel.
+        + Option: utiliser un subset K par classe (pour accélérer)
         """
         print("\n" + "=" * 60)
         print("ÉTAPE 2: CROSS-MODAL PRETRAINING")
@@ -77,16 +104,42 @@ class Pipeline:
         val_df   = pd.read_csv(self.config.paths.preprocessed_dir / "val_metadata.csv")
         test_df  = pd.read_csv(self.config.paths.preprocessed_dir / "test_metadata.csv")
 
+        # ---------- Subset K / classe (optionnel) ----------
+        tcfg = self.config.training
+        use_subset = bool(getattr(tcfg, "use_subset", False))
+
+        if use_subset:
+            seed = int(getattr(tcfg, "subset_seed", 42))
+            k_train = int(getattr(tcfg, "k_per_class_train", 0))
+            k_val   = int(getattr(tcfg, "k_per_class_val", 0))
+            k_test  = int(getattr(tcfg, "k_per_class_test", 0))
+
+            if k_train > 0:
+                train_df = self._sample_k_per_class(train_df, k_train, seed)
+            if k_val > 0:
+                val_df = self._sample_k_per_class(val_df, k_val, seed)
+            if k_test > 0:
+                test_df = self._sample_k_per_class(test_df, k_test, seed)
+
+            print("\n[Subset K/class activé]")
+            print(f"  Train: {len(train_df)} rows | classes={train_df['label'].nunique()} | k={k_train}")
+            print(f"  Val  : {len(val_df)} rows | classes={val_df['label'].nunique()} | k={k_val}")
+            print(f"  Test : {len(test_df)} rows | classes={test_df['label'].nunique()} | k={k_test}")
+        else:
+            print("\n[Subset K/class désactivé] -> dataset complet utilisé")
+
+        # ---------- Dataloaders ----------
         print("\nCréation des dataloaders...")
         dataloaders = create_dataloaders(
             self.config, train_df, val_df, test_df, mode="cross_modal"
         )
 
+        # ---------- Modèle ----------
         print("\nCréation du modèle...")
         model = CrossModalModel(self.config)
         print_model_info(model, "Cross-Modal Model")
 
-        # Multi-GPU (DataParallel)
+        # ---------- Multi-GPU (DataParallel) ----------
         n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
         if str(self.device).startswith("cuda") and n_gpu > 1:
             print(f"\n✓ Multi-GPU détecté: {n_gpu} GPUs -> DataParallel activé")
@@ -94,6 +147,7 @@ class Pipeline:
         else:
             print(f"\n✓ Single GPU/CPU: device={self.device}, n_gpu={n_gpu}")
 
+        # ---------- Trainer ----------
         loss_fn = SigmoidContrastiveLoss(learnable=True)
         trainer = CrossModalTrainer(model, loss_fn, self.config, device=str(self.device))
 
@@ -105,26 +159,12 @@ class Pipeline:
             save_path=self.config.paths.results_dir / "pretraining_curves.png",
         )
 
-        print(f"\n✓ Pretraining terminé. Best val loss: {trainer.best_metric:.4f}")
+        best_val = getattr(trainer, "best_metric", None)
+        if best_val is None:
+            best_val = getattr(trainer, "best_val_loss", None)
 
-        # Sauvegarde state_dict final (dé-wrappé si DataParallel)
-        try:
-            save_dir = self.config.paths.checkpoints_dir / "cross_modal"
-            save_dir.mkdir(parents=True, exist_ok=True)
-            final_path = save_dir / "final_model_state_dict.pt"
-
-            state_dict = (
-                trainer.model.module.state_dict()
-                if isinstance(trainer.model, torch.nn.DataParallel)
-                else trainer.model.state_dict()
-            )
-            torch.save(state_dict, final_path)
-            print(f"✓ State_dict final sauvegardé: {final_path}")
-        except Exception as e:
-            print(f"Avertissement: sauvegarde state_dict final échouée: {e}")
-
+        print(f"\n✓ Pretraining terminé. Best val: {best_val}")
         return trainer
-
     def run_classification(self, mode="both"):
         """
         Étape 3: Classification (linear probe + finetune)

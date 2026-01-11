@@ -103,7 +103,14 @@ class TrainingConfig:
     seed: int = 42
     device: str = 'cuda'  # ou 'cpu'
     num_workers: int = 2
-    
+    use_subset: bool = True
+
+    # K par classe (0 = désactivé)
+    k_per_class_train: int = 200
+    k_per_class_val: int = 50
+    k_per_class_test: int = 50
+
+    subset_seed: int = 42
     # Cross-modal pretraining
     pretrain_epochs: int = 20
     pretrain_batch_size: int = 32
