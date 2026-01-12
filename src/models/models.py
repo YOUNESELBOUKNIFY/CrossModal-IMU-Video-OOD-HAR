@@ -154,17 +154,28 @@ class VideoEncoder(nn.Module):
             raise ValueError(f"Backbone inconnu: {model_cfg.video_backbone}")
         
         # Enlever la dernière couche FC
-        if model_cfg.video_backbone == 'resnet18':
-            self.backbone = nn.Sequential(*list(backbone.children())[:-1])
+        if model_cfg.video_backbone == 'MCG-NJU/videomae-base-ssv2':
+            self.is_videomae = True
+            self.backbone = VideoMAEModel.from_pretrained(
+                model_cfg.video_backbone
+            )
+            self.feature_dim = self.backbone.config.hidden_size  # 768
+
         else:
-            self.backbone = backbone.features
-        
-        # Projection vers d_model
-        self.projection = nn.Linear(self.feature_dim, model_cfg.video_d_model)
-        
-        # Aggregation temporelle
-        self.temporal_pool = nn.AdaptiveAvgPool1d(1)
-        
+            raise ValueError(f"Backbone inconnu: {model_cfg.video_backbone}")
+
+        # ======================
+        # 🔹 Projection
+        # ======================
+        self.projection = nn.Linear(
+            self.feature_dim,
+            model_cfg.video_d_model
+        )
+
+        # CNN seulement
+        if not self.is_videomae:
+            self.temporal_pool = nn.AdaptiveAvgPool1d(1)
+            
     def forward(self, x):
         """
         Args:
