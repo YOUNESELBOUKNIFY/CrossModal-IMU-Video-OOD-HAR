@@ -57,7 +57,7 @@ class DataConfig:
     
     # Vidéo
     video_fps: int = 25
-    video_frames_per_window: int = 10  # 10 frames par clip de 5s
+    video_frames_per_window: int = 16  # 10 frames par clip de 5s
     video_resize: tuple = (224, 224)
     
     # Normalisation
