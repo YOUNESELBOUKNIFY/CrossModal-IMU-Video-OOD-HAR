@@ -106,7 +106,7 @@ class TrainingConfig:
 
     # Cross-modal pretraining
     pretrain_epochs: int = 20
-    pretrain_batch_size: int = 32
+    pretrain_batch_size: int = 16
     pretrain_lr: float = 1e-4
     pretrain_weight_decay: float = 0.01
     pretrain_warmup_epochs: int = 5
