@@ -105,7 +105,7 @@ class TrainingConfig:
     num_workers: int = 2
 
     # Cross-modal pretraining
-    pretrain_epochs: int = 20
+    pretrain_epochs: int = 10
     pretrain_batch_size: int = 16
     pretrain_lr: float = 1e-4
     pretrain_weight_decay: float = 0.01
