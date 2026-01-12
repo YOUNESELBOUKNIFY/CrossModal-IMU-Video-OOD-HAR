@@ -8,6 +8,8 @@ import torch.nn.functional as F
 import math
 from torchvision import models
 
+from transformers import VideoMAEModel
+
 
 # ============ IMU Encoder (PatchTST-inspired) ============
 
