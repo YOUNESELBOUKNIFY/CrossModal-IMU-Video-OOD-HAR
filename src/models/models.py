@@ -136,74 +136,83 @@ class IMUEncoder(nn.Module):
 
 class VideoEncoder(nn.Module):
     """
-    Encodeur vidéo simplifié basé sur CNN 2D + pooling temporel
-    Pour version production, utiliser VideoMAE ou autre
+    Video encoder:
+    - CNN 2D (resnet18 / mobilenet_v2) + pooling temporel
+    - OU HuggingFace VideoMAEModel (ex: MCG-NJU/videomae-base-ssv2)
     """
-    
     def __init__(self, config):
         super().__init__()
         self.config = config
         model_cfg = config.model
-        
-        # Backbone CNN (ResNet18 ou MobileNet)
-        if model_cfg.video_backbone == 'resnet18':
-            backbone = models.resnet18(pretrained=model_cfg.video_pretrained)
-            self.feature_dim = 512
-        elif model_cfg.video_backbone == 'mobilenet_v2':
-            backbone = models.mobilenet_v2(pretrained=model_cfg.video_pretrained)
-            self.feature_dim = 1280
-        else:
-            raise ValueError(f"Backbone inconnu: {model_cfg.video_backbone}")
-        
-        # Enlever la dernière couche FC
-        if model_cfg.video_backbone == 'MCG-NJU/videomae-base-ssv2':
+
+        vb = model_cfg.video_backbone
+        self.is_videomae = False
+
+        # ----------------------
+        # 1) HuggingFace VideoMAE
+        # ----------------------
+        if isinstance(vb, str) and ("videomae" in vb.lower() or "/" in vb):
+            # ex: "MCG-NJU/videomae-base-ssv2"
             self.is_videomae = True
-            self.backbone = VideoMAEModel.from_pretrained(
-                model_cfg.video_backbone
-            )
-            self.feature_dim = self.backbone.config.hidden_size  # 768
+            self.backbone = VideoMAEModel.from_pretrained(vb)
+            self.feature_dim = self.backbone.config.hidden_size  # souvent 768
+
+        # ----------------------
+        # 2) CNN backbones
+        # ----------------------
+        elif vb == "resnet18":
+            backbone = models.resnet18(pretrained=model_cfg.video_pretrained)
+            # enlever head => garder feature map (B*T, 512, h, w)
+            self.backbone = nn.Sequential(*list(backbone.children())[:-2])
+            self.feature_dim = 512
+
+        elif vb == "mobilenet_v2":
+            backbone = models.mobilenet_v2(pretrained=model_cfg.video_pretrained)
+            # features => (B*T, 1280, h, w)
+            self.backbone = backbone.features
+            self.feature_dim = 1280
 
         else:
-            raise ValueError(f"Backbone inconnu: {model_cfg.video_backbone}")
+            raise ValueError(f"Backbone inconnu: {vb}")
 
-        # ======================
-        # 🔹 Projection
-        # ======================
-        self.projection = nn.Linear(
-            self.feature_dim,
-            model_cfg.video_d_model
-        )
+        # Projection vers video_d_model
+        self.projection = nn.Linear(self.feature_dim, model_cfg.video_d_model)
 
-        # CNN seulement
+        # Pooling temporel seulement pour CNN (pour VideoMAE on sort déjà un vecteur global)
         if not self.is_videomae:
             self.temporal_pool = nn.AdaptiveAvgPool1d(1)
-            
+
     def forward(self, x):
         """
         Args:
-            x: (batch, num_frames, C, H, W)
+            x: (B, T, C, H, W)
         Returns:
-            embeddings: (batch, video_d_model)
+            pooled: (B, video_d_model)
         """
         B, T, C, H, W = x.shape
-        
-        # Reshape pour traiter toutes les frames ensemble
-        x = x.view(B * T, C, H, W)
-        
-        # Extract features
-        features = self.backbone(x)  # (B*T, feature_dim, h, w)
-        
-        # Global average pooling spatial
-        features = F.adaptive_avg_pool2d(features, (1, 1))  # (B*T, feature_dim, 1, 1)
-        features = features.view(B, T, self.feature_dim)  # (B, T, feature_dim)
-        
-        # Projection
-        features = self.projection(features)  # (B, T, video_d_model)
-        
-        # Temporal pooling
-        features = features.transpose(1, 2)  # (B, video_d_model, T)
-        pooled = self.temporal_pool(features).squeeze(-1)  # (B, video_d_model)
-        
+
+        # ----------------------
+        # VideoMAE (HF)
+        # ----------------------
+        if self.is_videomae:
+            # HF attend pixel_values (B, T, C, H, W) float
+            out = self.backbone(pixel_values=x)
+            # last_hidden_state: (B, num_tokens, hidden)
+            feat = out.last_hidden_state[:, 0]  # CLS token (B, hidden)
+            feat = self.projection(feat)        # (B, video_d_model)
+            return feat
+
+        # ----------------------
+        # CNN 2D + pooling temporel
+        # ----------------------
+        x = x.view(B * T, C, H, W)              # (B*T, C, H, W)
+        fmap = self.backbone(x)                 # (B*T, feature_dim, h, w)
+        fmap = F.adaptive_avg_pool2d(fmap, (1, 1)).squeeze(-1).squeeze(-1)  # (B*T, feature_dim)
+        feats = fmap.view(B, T, self.feature_dim)                           # (B, T, feature_dim)
+
+        feats = self.projection(feats)          # (B, T, video_d_model)
+        feats = feats.transpose(1, 2)           # (B, video_d_model, T)
+        pooled = self.temporal_pool(feats).squeeze(-1)  # (B, video_d_model)
         return pooled
 
 
