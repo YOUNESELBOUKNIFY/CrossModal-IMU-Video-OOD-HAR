@@ -81,10 +81,10 @@ class ModelConfig:
     imu_num_layers: int = 4
     imu_dropout: float = 0.1
     
-    # Video Encoder (simple pour commencer)
-    video_backbone: str = 'resnet18'  # ou 'mobilenet_v2' pour Kaggle
+    # Video Encoder 
+    video_backbone: str = 'MCG-NJU/videomae-base-ssv2'  # 
     video_pretrained: bool = True
-    video_d_model: int = 512
+    video_d_model: int = 768 
     
     # Projection heads
     projection_dim: int = 256
@@ -103,14 +103,7 @@ class TrainingConfig:
     seed: int = 42
     device: str = 'cuda'  # ou 'cpu'
     num_workers: int = 2
-    use_subset: bool = True
 
-    # K par classe (0 = désactivé)
-    k_per_class_train: int = 200
-    k_per_class_val: int = 50
-    k_per_class_test: int = 50
-
-    subset_seed: int = 42
     # Cross-modal pretraining
     pretrain_epochs: int = 20
     pretrain_batch_size: int = 32
